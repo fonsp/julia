@@ -2181,3 +2181,17 @@ end
         @test ex == err
     end
 end
+
+# issue #34967
+@test_throws LoadError("string", 2, ErrorException("syntax: invalid UTF-8 character")) include_string(@__MODULE__,
+                                      "x34967 = 1\n# Halloa\xf5b\nx34967 = 2")
+@test x34967 == 1
+@test_throws LoadError("string", 1, ErrorException("syntax: invalid UTF-8 character")) include_string(@__MODULE__,
+                                      "x\xf5 = 3\n# Halloa\xf5b\nx34967 = 4")
+@test_throws LoadError("string", 3, ErrorException("syntax: invalid UTF-8 character")) include_string(@__MODULE__,
+                                      """
+                                      # line 1
+                                      # line 2
+                                      # Hello\xf5b
+                                      x34967 = 6
+                                      """)
