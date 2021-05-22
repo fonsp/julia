@@ -47,9 +47,7 @@
 #include <llvm/MC/MCStreamer.h>
 #include <llvm/MC/MCAsmBackend.h>
 #include <llvm/MC/MCCodeEmitter.h>
-#if JL_LLVM_VERSION >= 100000
 #include <llvm/Support/CodeGen.h>
-#endif
 
 #include <llvm/IR/LegacyPassManagers.h>
 #include <llvm/Transforms/Utils/Cloning.h>
@@ -61,12 +59,6 @@ using namespace llvm;
 namespace llvm {
     extern Pass *createLowerSimdLoopPass();
 }
-
-#if JL_LLVM_VERSION < 100000
-static const TargetMachine::CodeGenFileType CGFT_ObjectFile = TargetMachine::CGFT_ObjectFile;
-static const TargetMachine::CodeGenFileType CGFT_AssemblyFile = TargetMachine::CGFT_AssemblyFile;
-#endif
-
 
 #include "julia.h"
 #include "julia_internal.h"
@@ -266,9 +258,11 @@ static void jl_ci_cache_lookup(const jl_cgparams_t &cgparams, jl_method_instance
         }
         else {
             *src_out = jl_type_infer(mi, world, 0);
-            codeinst = jl_get_method_inferred(mi, (*src_out)->rettype, (*src_out)->min_world, (*src_out)->max_world);
-            if ((*src_out)->inferred && !codeinst->inferred)
-                codeinst->inferred = jl_nothing;
+            if (*src_out) {
+                codeinst = jl_get_method_inferred(mi, (*src_out)->rettype, (*src_out)->min_world, (*src_out)->max_world);
+                if ((*src_out)->inferred && !codeinst->inferred)
+                    codeinst->inferred = jl_nothing;
+            }
         }
     }
     *ci_out = codeinst;
@@ -277,8 +271,8 @@ static void jl_ci_cache_lookup(const jl_cgparams_t &cgparams, jl_method_instance
 // takes the running content that has collected in the shadow module and dump it to disk
 // this builds the object file portion of the sysimage files for fast startup, and can
 // also be used be extern consumers like GPUCompiler.jl to obtain a module containing
-// all reachable & inferrrable functions. The `policy` flag switches between the defaul
-// mode `0` and the extern mode `1`.
+// all reachable & inferrrable functions. The `policy` flag switches between the default
+// mode `0`, the extern mode `1`, and imaging mode `2`.
 extern "C" JL_DLLEXPORT
 void *jl_create_native(jl_array_t *methods, const jl_cgparams_t cgparams, int _policy)
 {
@@ -290,8 +284,14 @@ void *jl_create_native(jl_array_t *methods, const jl_cgparams_t cgparams, int _p
     jl_code_info_t *src = NULL;
     JL_GC_PUSH1(&src);
     JL_LOCK(&codegen_lock);
+    uint64_t compiler_start_time = 0;
+    int tid = jl_threadid();
+    if (jl_measure_compile_time[tid])
+        compiler_start_time = jl_hrtime();
 
     CompilationPolicy policy = (CompilationPolicy) _policy;
+    if (policy == CompilationPolicy::ImagingMode)
+        imaging_mode = 1;
     std::unique_ptr<Module> clone(jl_create_llvm_module("text"));
 
     // compile all methods for the current world and type-inference world
@@ -301,7 +301,7 @@ void *jl_create_native(jl_array_t *methods, const jl_cgparams_t cgparams, int _p
         if (!params.world)
             continue;
         // Don't emit methods for the typeinf_world with extern policy
-        if (policy == CompilationPolicy::Extern && params.world == jl_typeinf_world)
+        if (policy != CompilationPolicy::Default && params.world == jl_typeinf_world)
             continue;
         size_t i, l;
         for (i = 0, l = jl_array_len(methods); i < l; i++) {
@@ -398,21 +398,26 @@ void *jl_create_native(jl_array_t *methods, const jl_cgparams_t cgparams, int _p
 
     // move everything inside, now that we've merged everything
     // (before adding the exported headers)
-    for (GlobalObject &G : clone->global_objects()) {
-        if (!G.isDeclaration()) {
-            G.setLinkage(Function::InternalLinkage);
-            makeSafeName(G);
-            addComdat(&G);
+    if (policy == CompilationPolicy::Default) {
+        for (GlobalObject &G : clone->global_objects()) {
+            if (!G.isDeclaration()) {
+                G.setLinkage(Function::InternalLinkage);
+                makeSafeName(G);
+                addComdat(&G);
 #if defined(_OS_WINDOWS_) && defined(_CPU_X86_64_)
-            // Add unwind exception personalities to functions to handle async exceptions
-            if (Function *F = dyn_cast<Function>(&G))
-                F->setPersonalityFn(juliapersonality_func);
+                // Add unwind exception personalities to functions to handle async exceptions
+                if (Function *F = dyn_cast<Function>(&G))
+                    F->setPersonalityFn(juliapersonality_func);
 #endif
+            }
         }
     }
 
     data->M = std::move(clone);
-
+    if (jl_measure_compile_time[tid])
+        jl_cumulative_compile_time[tid] += (jl_hrtime() - compiler_start_time);
+    if (policy == CompilationPolicy::ImagingMode)
+        imaging_mode = 0;
     JL_UNLOCK(&codegen_lock); // Might GC
     return (void*)data;
 }
@@ -504,8 +509,10 @@ void jl_dump_native(void *native_code,
 
     if (unopt_bc_fname)
         PM.add(createBitcodeWriterPass(unopt_bc_OS));
-    if (bc_fname || obj_fname || asm_fname)
+    if (bc_fname || obj_fname || asm_fname) {
         addOptimizationPasses(&PM, jl_options.opt_level, true, true);
+        addMachinePasses(&PM, TM.get());
+    }
     if (bc_fname)
         PM.add(createBitcodeWriterPass(bc_OS));
     if (obj_fname)
@@ -599,6 +606,15 @@ void addTargetPasses(legacy::PassManagerBase *PM, TargetMachine *TM)
     PM->add(new TargetLibraryInfoWrapperPass(Triple(TM->getTargetTriple())));
     PM->add(createTargetTransformInfoWrapperPass(TM->getTargetIRAnalysis()));
 }
+
+
+void addMachinePasses(legacy::PassManagerBase *PM, TargetMachine *TM)
+{
+    // TODO: don't do this on CPUs that natively support Float16
+    PM->add(createDemoteFloat16Pass());
+    PM->add(createGVNPass());
+}
+
 
 // this defines the set of optimization passes defined for Julia at various optimization levels.
 // it assumes that the TLI and TTI wrapper passes have already been added.
@@ -805,6 +821,7 @@ public:
         TPMAdapter Adapter(TPM);
         addTargetPasses(&Adapter, jl_TargetMachine);
         addOptimizationPasses(&Adapter, OptLevel);
+        addMachinePasses(&Adapter, jl_TargetMachine);
     }
     JuliaPipeline() : Pass(PT_PassManager, ID) {}
     Pass *createPrinterPass(raw_ostream &O, const std::string &Banner) const override {
@@ -842,6 +859,7 @@ void *jl_get_llvmf_defn(jl_method_instance_t *mi, size_t world, char getwrapper,
         PM = new legacy::PassManager();
         addTargetPasses(PM, jl_TargetMachine);
         addOptimizationPasses(PM, jl_options.opt_level);
+        addMachinePasses(PM, jl_TargetMachine);
     }
 
     // get the source code for this function
@@ -876,6 +894,10 @@ void *jl_get_llvmf_defn(jl_method_instance_t *mi, size_t world, char getwrapper,
         std::unique_ptr<Module> m;
         jl_llvm_functions_t decls;
         JL_LOCK(&codegen_lock);
+        uint64_t compiler_start_time = 0;
+        int tid = jl_threadid();
+        if (jl_measure_compile_time[tid])
+            compiler_start_time = jl_hrtime();
         std::tie(m, decls) = jl_emit_code(mi, src, jlrettype, output);
 
         Function *F = NULL;
@@ -899,6 +921,8 @@ void *jl_get_llvmf_defn(jl_method_instance_t *mi, size_t world, char getwrapper,
             m.release(); // the return object `llvmf` will be the owning pointer
         }
         JL_GC_POP();
+        if (jl_measure_compile_time[tid])
+            jl_cumulative_compile_time[tid] += (jl_hrtime() - compiler_start_time);
         JL_UNLOCK(&codegen_lock); // Might GC
         if (F)
             return F;
@@ -914,23 +938,14 @@ addPassesToGenerateCode(LLVMTargetMachine *TM, PassManagerBase &PM) {
     TargetPassConfig *PassConfig = TM->createPassConfig(PM);
     PassConfig->setDisableVerify(false);
     PM.add(PassConfig);
-#if JL_LLVM_VERSION >= 100000
     MachineModuleInfoWrapperPass *MMIWP =
         new MachineModuleInfoWrapperPass(TM);
     PM.add(MMIWP);
-#else
-    MachineModuleInfo *MMI = new MachineModuleInfo(TM);
-    PM.add(MMI);
-#endif
     if (PassConfig->addISelPasses())
         return NULL;
     PassConfig->addMachinePasses();
     PassConfig->setInitialized();
-#if JL_LLVM_VERSION >= 100000
     return &MMIWP->getMMI().getContext();
-#else
-    return &MMI->getContext();
-#endif
 }
 
 void jl_strip_llvm_debug(Module *m);
@@ -971,11 +986,7 @@ jl_value_t *jl_dump_llvm_asm(void *F, const char* asm_variant, const char *debug
              std::unique_ptr<MCAsmBackend> MAB(TM->getTarget().createMCAsmBackend(
                 STI, MRI, TM->Options.MCOptions));
             std::unique_ptr<MCCodeEmitter> MCE;
-#if JL_LLVM_VERSION >= 100000
             auto FOut = std::make_unique<formatted_raw_ostream>(asmfile);
-#else
-            auto FOut = llvm::make_unique<formatted_raw_ostream>(asmfile);
-#endif
             std::unique_ptr<MCStreamer> S(TM->getTarget().createAsmStreamer(
                 *Context, std::move(FOut), true,
                 true, InstPrinter,

@@ -63,23 +63,25 @@ call. Finally, chains of comparisons have their own special expression structure
 
 ### Bracketed forms
 
-| Input                    | AST                                  |
-|:------------------------ |:------------------------------------ |
-| `a[i]`                   | `(ref a i)`                          |
-| `t[i;j]`                 | `(typed_vcat t i j)`                 |
-| `t[i j]`                 | `(typed_hcat t i j)`                 |
-| `t[a b; c d]`            | `(typed_vcat t (row a b) (row c d))` |
-| `a{b}`                   | `(curly a b)`                        |
-| `a{b;c}`                 | `(curly a (parameters c) b)`         |
-| `[x]`                    | `(vect x)`                           |
-| `[x,y]`                  | `(vect x y)`                         |
-| `[x;y]`                  | `(vcat x y)`                         |
-| `[x y]`                  | `(hcat x y)`                         |
-| `[x y; z t]`             | `(vcat (row x y) (row z t))`         |
-| `[x for y in z, a in b]` | `(comprehension x (= y z) (= a b))`  |
-| `T[x for y in z]`        | `(typed_comprehension T x (= y z))`  |
-| `(a, b, c)`              | `(tuple a b c)`                      |
-| `(a; b; c)`              | `(block a (block b c))`              |
+| Input                    | AST                                               |
+|:------------------------ |:------------------------------------------------- |
+| `a[i]`                   | `(ref a i)`                                       |
+| `t[i;j]`                 | `(typed_vcat t i j)`                              |
+| `t[i j]`                 | `(typed_hcat t i j)`                              |
+| `t[a b; c d]`            | `(typed_vcat t (row a b) (row c d))`              |
+| `t[a b;;; c d]`          | `(typed_ncat t 3 (row a b) (row c d))`            |
+| `a{b}`                   | `(curly a b)`                                     |
+| `a{b;c}`                 | `(curly a (parameters c) b)`                      |
+| `[x]`                    | `(vect x)`                                        |
+| `[x,y]`                  | `(vect x y)`                                      |
+| `[x;y]`                  | `(vcat x y)`                                      |
+| `[x y]`                  | `(hcat x y)`                                      |
+| `[x y; z t]`             | `(vcat (row x y) (row z t))`                      |
+| `[x;y;; z;t;;;]`         | `(ncat 3 (nrow 2 (nrow 1 x y) (nrow 1 z t)))`     |
+| `[x for y in z, a in b]` | `(comprehension x (= y z) (= a b))`               |
+| `T[x for y in z]`        | `(typed_comprehension T x (= y z))`               |
+| `(a, b, c)`              | `(tuple a b c)`                                   |
+| `(a; b; c)`              | `(block a (block b c))`                           |
 
 ### Macros
 
@@ -254,7 +256,7 @@ types exist in lowered form:
     Identifies arguments and local variables by consecutive numbering. `Slot` is an abstract type
     with subtypes `SlotNumber` and `TypedSlot`. Both types have an integer-valued `id` field giving
     the slot index. Most slots have the same type at all uses, and so are represented with `SlotNumber`.
-    The types of these slots are found in the `slottypes` field of their `MethodInstance` object.
+    The types of these slots are found in the `slottypes` field of their `CodeInfo` object.
     Slots that require per-use type annotations are represented with `TypedSlot`, which has a `typ`
     field.
 
@@ -341,9 +343,10 @@ These symbols appear in the `head` field of [`Expr`](@ref)s in lowered form.
 
       * `args[1]`
 
-        A function name, or `false` if unknown. If a symbol, then the expression first
-        behaves like the 1-argument form above. This argument is ignored from then on. When
-        this is `false`, it means a method is being added strictly by type, `(::T)(x) = x`.
+        A function name, or `nothing` if unknown or unneeded. If a symbol, then the expression
+        first behaves like the 1-argument form above. This argument is ignored from then on.
+        It can be `nothing` when methods are added strictly by type, `(::T)(x) = x`,
+        or when a method is being added to an existing function, `MyModule.f(x) = x`.
 
       * `args[2]`
 

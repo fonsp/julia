@@ -46,7 +46,7 @@ include_string_test_func = include_string(@__MODULE__, "include_string_test() = 
 @test isdir(@__DIR__)
 @test @__DIR__() == dirname(@__FILE__)
 @test !endswith(@__DIR__, Base.Filesystem.path_separator)
-let exename = `$(Base.julia_cmd()) --compiled-modules=yes --startup-file=no`,
+let exename = `$(Base.julia_cmd()) --compiled-modules=yes --startup-file=no --color=no`,
     wd = sprint(show, pwd())
     s_dir = sprint(show, realpath(tempdir()))
     @test wd != s_dir
@@ -56,6 +56,9 @@ let exename = `$(Base.julia_cmd()) --compiled-modules=yes --startup-file=no`,
     @test !endswith(wd, Base.Filesystem.path_separator)
     @test !endswith(s_dir, Base.Filesystem.path_separator)
 end
+
+@test Base.in_sysimage(Base.PkgId(Base.UUID("cf7118a7-6976-5b1a-9a39-7adc72f591a4"), "UUIDs"))
+@test Base.in_sysimage(Base.PkgId(Base.UUID("3a7fdc7e-7467-41b4-9f64-ea033d046d5b"), "NotAPackage")) == false
 
 # Issue #5789 and PR #13542:
 mktempdir() do dir
@@ -104,6 +107,11 @@ let shastr1 = "ab"^20, shastr2 = "ac"^20
     @test !isless(hash1, hash1)
 end
 
+# Test bad SHA1 values
+@test_throws ArgumentError SHA1("this is not a valid SHA1")
+@test_throws ArgumentError parse(SHA1, "either is this")
+@test tryparse(SHA1, "nor this") === nothing
+
 let uuidstr = "ab"^4 * "-" * "ab"^2 * "-" * "ab"^2 * "-" * "ab"^2 * "-" * "ab"^6
     uuid = UUID(uuidstr)
     @test uuid == eval(Meta.parse(repr(uuid))) # check show method
@@ -121,6 +129,8 @@ let uuidstr = "ab"^4 * "-" * "ab"^2 * "-" * "ab"^2 * "-" * "ab"^2 * "-" * "ab"^6
     @test parse(UUID, uuidstr2) == uuid2
 end
 @test_throws ArgumentError UUID("@"^4 * "-" * "@"^2 * "-" * "@"^2 * "-" * "@"^2 * "-" * "@"^6)
+@test_throws ArgumentError parse(UUID, "not a UUID")
+@test tryparse(UUID, "either is this") === nothing
 
 function subset(v::Vector{T}, m::Int) where T
     T[v[j] for j = 1:length(v) if ((m >>> (j - 1)) & 1) == 1]
@@ -166,10 +176,9 @@ end
                 d = findfirst(line -> line == "[deps]", p)
                 t = findfirst(line -> startswith(line, "This"), p)
                 # look up various packages by name
-                cache = Base.TOMLCache()
-                root = Base.explicit_project_deps_get(project_file, "Root", cache)
-                this = Base.explicit_project_deps_get(project_file, "This", cache)
-                that = Base.explicit_project_deps_get(project_file, "That", cache)
+                root = Base.explicit_project_deps_get(project_file, "Root")
+                this = Base.explicit_project_deps_get(project_file, "This")
+                that = Base.explicit_project_deps_get(project_file, "That")
                 # test that the correct answers are given
                 @test root == (something(n, N+1) ≥ something(d, N+1) ? nothing :
                                something(u, N+1) < something(d, N+1) ? root_uuid : proj_uuid)
@@ -186,22 +195,21 @@ saved_load_path = copy(LOAD_PATH)
 saved_depot_path = copy(DEPOT_PATH)
 saved_active_project = Base.ACTIVE_PROJECT[]
 
-push!(empty!(LOAD_PATH), "project")
-push!(empty!(DEPOT_PATH), "depot")
+push!(empty!(LOAD_PATH), joinpath(@__DIR__, "project"))
+append!(empty!(DEPOT_PATH), [mktempdir(), joinpath(@__DIR__, "depot")])
 Base.ACTIVE_PROJECT[] = nothing
 
-@test load_path() == [abspath("project","Project.toml")]
-
+@test load_path() == [joinpath(@__DIR__, "project", "Project.toml")]
 
 # locate `tail(names)` package by following the search path graph through `names` starting from `where`
 function recurse_package(where::PkgId, name::String, names::String...)
-    pkg = identify_package(where, name, Base.TOMLCache())
+    pkg = identify_package(where, name)
     pkg === nothing && return nothing
     return recurse_package(pkg, names...)
 end
 
 recurse_package(pkg::String) = identify_package(pkg)
-recurse_package(where::PkgId, pkg::String) = identify_package(where, pkg, Base.TOMLCache())
+recurse_package(where::PkgId, pkg::String) = identify_package(where, pkg)
 
 function recurse_package(name::String, names::String...)
     pkg = identify_package(name)
@@ -222,6 +230,7 @@ end
         pkg = recurse_package(n...)
         @test pkg == PkgId(UUID(uuid), n[end])
         @test joinpath(@__DIR__, normpath(path)) == locate_package(pkg)
+        @test Base.compilecache_path(pkg, UInt64(0)) == Base.compilecache_path(pkg, UInt64(0))
     end
     @test identify_package("Baz") == nothing
     @test identify_package("Qux") == nothing
@@ -305,6 +314,11 @@ module NotPkgModule; end
         @test pkgdir(Foo.SubFoo1) == normpath(abspath(@__DIR__, "project/deps/Foo1"))
         @test pkgdir(Foo.SubFoo2) == normpath(abspath(@__DIR__, "project/deps/Foo1"))
         @test pkgdir(NotPkgModule) === nothing
+
+        @test pkgdir(Foo, "src") == normpath(abspath(@__DIR__, "project/deps/Foo1/src"))
+        @test pkgdir(Foo.SubFoo1, "src") == normpath(abspath(@__DIR__, "project/deps/Foo1/src"))
+        @test pkgdir(Foo.SubFoo2, "src") == normpath(abspath(@__DIR__, "project/deps/Foo1/src"))
+        @test pkgdir(NotPkgModule, "src") === nothing
     end
 
 end
@@ -708,4 +722,11 @@ import .Foo.Libdl; import Libdl
                   exprs[2].args[[1,3]] == [Symbol("@test"), :(1 == 2)]
         end
     end
+end
+
+@testset "`Base.project_names` and friends" begin
+    # Some functions in Pkg assumes that these tuples have the same length
+    n = length(Base.project_names)
+    @test length(Base.manifest_names) == n
+    @test length(Base.preferences_names) == n
 end

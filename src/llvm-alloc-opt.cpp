@@ -24,9 +24,7 @@
 #include <llvm/Support/Debug.h>
 #include <llvm/Transforms/Utils/PromoteMemToReg.h>
 
-#if JL_LLVM_VERSION >= 100000
 #include <llvm/InitializePasses.h>
-#endif
 
 #include "codegen_shared.h"
 #include "julia.h"
@@ -64,13 +62,8 @@ static bool hasObjref(Type *ty)
 {
     if (auto ptrty = dyn_cast<PointerType>(ty))
         return ptrty->getAddressSpace() == AddressSpace::Tracked;
-#if JL_LLVM_VERSION >= 110000
     if (isa<ArrayType>(ty) || isa<VectorType>(ty))
-        return GetElementPtrInst::getTypeAtIndex(ty, (uint64_t)0);
-#else
-    if (auto seqty = dyn_cast<SequentialType>(ty))
-        return hasObjref(seqty->getElementType());
-#endif
+        return hasObjref(GetElementPtrInst::getTypeAtIndex(ty, (uint64_t)0));
     if (auto structty = dyn_cast<StructType>(ty)) {
         for (auto elty: structty->elements()) {
             if (hasObjref(elty)) {
@@ -159,6 +152,7 @@ private:
     void removeAlloc(CallInst *orig_inst);
     void moveToStack(CallInst *orig_inst, size_t sz, bool has_ref);
     void splitOnStack(CallInst *orig_inst);
+    void optimizeTag(CallInst *orig_inst);
 
     Function &F;
     AllocOpt &pass;
@@ -260,8 +254,9 @@ private:
         bool refload:1;
         // There are objects fields being stored
         bool refstore:1;
-        // There are memset call
-        bool hasmemset:1;
+        // There are typeof call
+        // This can be optimized without optimizing out the allocation itself
+        bool hastypeof:1;
         // There are store/load/memset on this object with offset or size (or value for memset)
         // that cannot be statically computed.
         // This is a weaker form of `addrescaped` since `hasload` can still be used
@@ -275,6 +270,7 @@ private:
             haspreserve = false;
             refload = false;
             refstore = false;
+            hastypeof = false;
             hasunknownmem = false;
             uses.clear();
             preserves.clear();
@@ -327,8 +323,11 @@ void Optimizer::optimizeAll()
         auto orig = item.first;
         size_t sz = item.second;
         checkInst(orig);
-        if (use_info.escaped)
+        if (use_info.escaped) {
+            if (use_info.hastypeof)
+                optimizeTag(orig);
             continue;
+        }
         if (!use_info.addrescaped && !use_info.hasload && (!use_info.haspreserve ||
                                                            !use_info.refstore)) {
             // No one took the address, no one reads anything and there's no meaningful
@@ -344,7 +343,8 @@ void Optimizer::optimizeAll()
             if (field.hasobjref) {
                 has_ref = true;
                 // This can be relaxed a little based on hasload
-                if (field.hasaggr || field.multiloc) {
+                // TODO: add support for hasaggr load/store
+                if (field.hasaggr || field.multiloc || field.size != sizeof(void*)) {
                     has_refaggr = true;
                     break;
                 }
@@ -355,13 +355,12 @@ void Optimizer::optimizeAll()
             splitOnStack(orig);
             continue;
         }
-        if (has_ref) {
-            if (use_info.memops.size() != 1 || has_refaggr ||
-                use_info.memops.begin()->second.size != sz) {
-                continue;
-            }
-            // The object only has a single field that's a reference with only one kind of access.
+        if (has_refaggr) {
+            if (use_info.hastypeof)
+                optimizeTag(orig);
+            continue;
         }
+        // The object has no fields with mix reference access
         moveToStack(orig, sz, has_ref);
     }
 }
@@ -436,6 +435,7 @@ Optimizer::AllocUseInfo::getField(uint32_t offset, uint32_t size, Type *elty)
         if (it->first + it->second.size >= offset + size) {
             if (it->second.elty != elty)
                 it->second.elty = nullptr;
+            assert(it->second.elty == nullptr || (it->first == offset && it->second.size == size));
             return *it;
         }
         if (it->first + it->second.size > offset) {
@@ -446,7 +446,7 @@ Optimizer::AllocUseInfo::getField(uint32_t offset, uint32_t size, Type *elty)
     else {
         it = memops.begin();
     }
-    // Now fine the last slot that overlaps with the current memory location.
+    // Now find the last slot that overlaps with the current memory location.
     // Also set `lb` if we didn't find any above.
     for (; it != end && it->first < offset + size; ++it) {
         if (lb == end)
@@ -485,8 +485,8 @@ bool Optimizer::AllocUseInfo::addMemOp(Instruction *inst, unsigned opno, uint32_
     memop.isaggr = isa<StructType>(elty) || isa<ArrayType>(elty) || isa<VectorType>(elty);
     memop.isobjref = hasObjref(elty);
     auto &field = getField(offset, size, elty);
-    if (field.first != offset || field.second.size != size)
-        field.second.multiloc = true;
+    if (field.second.hasobjref != memop.isobjref)
+        field.second.multiloc = true; // can't split this field, since it contains a mix of references and bits
     if (!isstore)
         field.second.hasload = true;
     if (memop.isobjref) {
@@ -572,7 +572,6 @@ void Optimizer::checkInst(Instruction *I)
                 if (auto id = II->getIntrinsicID()) {
                     if (id == Intrinsic::memset) {
                         assert(call->getNumArgOperands() == 4);
-                        use_info.hasmemset = true;
                         if (cur.offset == UINT32_MAX ||
                             !isa<ConstantInt>(call->getArgOperand(2)) ||
                             !isa<ConstantInt>(call->getArgOperand(1)) ||
@@ -599,7 +598,12 @@ void Optimizer::checkInst(Instruction *I)
                 use_info.addrescaped = true;
                 return true;
             }
-            if (pass.typeof_func == callee || pass.write_barrier_func == callee)
+            if (pass.typeof_func == callee) {
+                use_info.hastypeof = true;
+                assert(use->get() == I);
+                return true;
+            }
+            if (pass.write_barrier_func == callee)
                 return true;
             auto opno = use->getOperandNo();
             // Uses in `jl_roots` operand bundle are not counted as escaping, everything else is.
@@ -872,19 +876,9 @@ void Optimizer::replaceIntrinsicUseWith(IntrinsicInst *call, Intrinsic::ID ID,
         SmallVector<Intrinsic::IITDescriptor, 8> Table;
         getIntrinsicInfoTableEntries(ID, Table);
         ArrayRef<Intrinsic::IITDescriptor> TableRef = Table;
-#if JL_LLVM_VERSION >= 90000
         auto res = Intrinsic::matchIntrinsicSignature(newfType, TableRef, overloadTys);
         assert(res == Intrinsic::MatchIntrinsicTypes_Match);
         (void)res;
-#else
-        bool res = Intrinsic::matchIntrinsicType(oldfType->getReturnType(), TableRef, overloadTys);
-        assert(!res);
-        for (auto Ty : newfType->params()) {
-            res = Intrinsic::matchIntrinsicType(Ty, TableRef, overloadTys);
-            assert(!res);
-        }
-        (void)res;
-#endif
         bool matchvararg = Intrinsic::matchIntrinsicVarArg(newfType->isVarArg(), TableRef);
         assert(!matchvararg);
         (void)matchvararg;
@@ -934,7 +928,12 @@ void Optimizer::moveToStack(CallInst *orig_inst, size_t sz, bool has_ref)
         ptr = cast<Instruction>(prolog_builder.CreateBitCast(buff, pass.T_pint8));
     }
     else {
-        buff = prolog_builder.CreateAlloca(Type::getIntNTy(pass.getLLVMContext(), sz * 8));
+        Type *buffty;
+        if (pass.DL->isLegalInteger(sz * 8))
+            buffty = Type::getIntNTy(pass.getLLVMContext(), sz * 8);
+        else
+            buffty = ArrayType::get(Type::getInt8Ty(pass.getLLVMContext()), sz);
+        buff = prolog_builder.CreateAlloca(buffty);
         buff->setAlignment(Align(align));
         ptr = cast<Instruction>(prolog_builder.CreateBitCast(buff, pass.T_pint8));
     }
@@ -1145,6 +1144,25 @@ void Optimizer::removeAlloc(CallInst *orig_inst)
     }
 }
 
+// Unable to optimize out the allocation, do store to load forwarding on the tag instead.
+void Optimizer::optimizeTag(CallInst *orig_inst)
+{
+    auto tag = orig_inst->getArgOperand(2);
+    // `julia.typeof` is only legal on the original pointer, no need to scan recursively
+    for (auto user: orig_inst->users()) {
+        if (auto call = dyn_cast<CallInst>(user)) {
+            auto callee = call->getCalledOperand();
+            if (pass.typeof_func == callee) {
+                call->replaceAllUsesWith(tag);
+                // Push to the removed instructions to trigger `finalize` to
+                // return the correct result.
+                // Also so that we don't have to worry about iterator invalidation...
+                removed.push_back(call);
+            }
+        }
+    }
+}
+
 void Optimizer::splitOnStack(CallInst *orig_inst)
 {
     auto tag = orig_inst->getArgOperand(2);
@@ -1172,8 +1190,10 @@ void Optimizer::splitOnStack(CallInst *orig_inst)
         else if (field.elty && !field.multiloc) {
             allocty = field.elty;
         }
-        else {
+        else if (pass.DL->isLegalInteger(field.size * 8)) {
             allocty = Type::getIntNTy(pass.getLLVMContext(), field.size * 8);
+        } else {
+            allocty = ArrayType::get(Type::getInt8Ty(pass.getLLVMContext()), field.size);
         }
         slot.slot = prolog_builder.CreateAlloca(allocty);
         insertLifetime(prolog_builder.CreateBitCast(slot.slot, pass.T_pint8),
@@ -1262,11 +1282,7 @@ void Optimizer::splitOnStack(CallInst *orig_inst)
                 val = newload;
             }
             // TODO: should we use `load->clone()`, or manually copy any other metadata?
-#if JL_LLVM_VERSION >= 100000
             newload->setAlignment(load->getAlign());
-#else
-            newload->setAlignment(load->getAlignment());
-#endif
             // since we're moving heap-to-stack, it is safe to downgrade the atomic level to NotAtomic
             newload->setOrdering(AtomicOrdering::NotAtomic);
             load->replaceAllUsesWith(val);
@@ -1306,11 +1322,7 @@ void Optimizer::splitOnStack(CallInst *orig_inst)
                 newstore = builder.CreateStore(store_val, slot_gep(slot, offset, store_ty, builder));
             }
             // TODO: should we use `store->clone()`, or manually copy any other metadata?
-#if JL_LLVM_VERSION >= 100000
             newstore->setAlignment(store->getAlign());
-#else
-            newstore->setAlignment(store->getAlignment());
-#endif
             // since we're moving heap-to-stack, it is safe to downgrade the atomic level to NotAtomic
             newstore->setOrdering(AtomicOrdering::NotAtomic);
             store->eraseFromParent();
@@ -1356,11 +1368,7 @@ void Optimizer::splitOnStack(CallInst *orig_inst)
                             auto sub_size = std::min(slot.offset + slot.size, offset + size) -
                                 std::max(offset, slot.offset);
                             // TODO: alignment computation
-#if JL_LLVM_VERSION >= 100000
                             builder.CreateMemSet(ptr8, val_arg, sub_size, MaybeAlign(0));
-#else
-                            builder.CreateMemSet(ptr8, val_arg, sub_size, 0);
-#endif
                         }
                         call->eraseFromParent();
                         return;

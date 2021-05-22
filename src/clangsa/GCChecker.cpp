@@ -26,12 +26,7 @@
 #define USED_FUNC
 #endif
 
-#if LLVM_VERSION_MAJOR >= 10
 using std::make_unique;
-#else
-using llvm::make_unique;
-#define PathSensitiveBugReport BugReport
-#endif
 
 namespace {
 using namespace clang;
@@ -42,11 +37,7 @@ using namespace ento;
 
 static const Stmt *getStmtForDiagnostics(const ExplodedNode *N)
 {
-#if LLVM_VERSION_MAJOR >= 10
     return N->getStmtForDiagnostics();
-#else
-    return PathDiagnosticLocation::getStmt(N);
-#endif
 }
 
 
@@ -235,11 +226,7 @@ private:
 public:
   void checkBeginFunction(CheckerContext &Ctx) const;
   void checkEndFunction(const clang::ReturnStmt *RS, CheckerContext &Ctx) const;
-#if LLVM_VERSION_MAJOR >= 9
   bool evalCall(const CallEvent &Call, CheckerContext &C) const;
-#else
-  bool evalCall(const CallExpr *CE, CheckerContext &C) const;
-#endif
   void checkPreCall(const CallEvent &Call, CheckerContext &C) const;
   void checkPostCall(const CallEvent &Call, CheckerContext &C) const;
   void checkPostStmt(const CStyleCastExpr *CE, CheckerContext &C) const;
@@ -682,6 +669,16 @@ void GCChecker::checkBeginFunction(CheckerContext &C) const {
 void GCChecker::checkEndFunction(const clang::ReturnStmt *RS,
                                  CheckerContext &C) const {
   ProgramStateRef State = C.getState();
+
+  if (RS && gcEnabledHere(C) && RS->getRetValue() && isGCTracked(RS->getRetValue())) {
+    auto ResultVal = C.getSVal(RS->getRetValue());
+    SymbolRef Sym = ResultVal.getAsSymbol(true);
+    const ValueState *ValS = Sym ? State->get<GCValueMap>(Sym) : nullptr;
+    if (ValS && ValS->isPotentiallyFreed()) {
+      report_value_error(C, Sym, "Return value may have been GCed", RS->getSourceRange());
+    }
+  }
+
   bool Changed = false;
   if (State->get<GCDisabledAt>() == C.getStackFrame()->getIndex()) {
     State = State->set<GCDisabledAt>((unsigned)-1);
@@ -695,10 +692,7 @@ void GCChecker::checkEndFunction(const clang::ReturnStmt *RS,
     C.addTransition(State);
   if (!C.inTopFrame())
     return;
-  // If `RS` is NULL, the function did not return normally.
-  // This could be either an abort/assertion failure or an exception throw.
-  // Do not require the GC frame to match in such case.
-  if (RS && C.getState()->get<GCDepth>() > 0)
+  if (C.getState()->get<GCDepth>() > 0)
     report_error(C, "Non-popped GC frame present at end of function");
 }
 
@@ -749,6 +743,8 @@ bool GCChecker::isGCTrackedType(QualType QT) {
                    Name.endswith_lower("jl_task_t") ||
                    Name.endswith_lower("jl_uniontype_t") ||
                    Name.endswith_lower("jl_method_match_t") ||
+                   Name.endswith_lower("jl_vararg_t") ||
+                   Name.endswith_lower("jl_opaque_closure_t") ||
                    // Probably not technically true for these, but let's allow
                    // it
                    Name.endswith_lower("typemap_intersection_env") ||
@@ -867,11 +863,16 @@ bool GCChecker::processPotentialSafepoint(const CallEvent &Call,
     }
   }
 
+  // Don't free the return value
+  SymbolRef RetSym = Call.getReturnValue().getAsSymbol();
+
   // Symbolically free all unrooted values.
   GCValueMapTy AMap = State->get<GCValueMap>();
   for (auto I = AMap.begin(), E = AMap.end(); I != E; ++I) {
     if (I.getData().isJustAllocated()) {
       if (SpeciallyRootedSymbol == I.getKey())
+        continue;
+      if (RetSym == I.getKey())
         continue;
       State = State->set<GCValueMap>(I.getKey(), ValueState::getFreed());
       DidChange = true;
@@ -941,17 +942,7 @@ bool GCChecker::processAllocationOfResult(const CallEvent &Call,
     State = State->set<GCValueMap>(Sym, ValueState::getRooted(nullptr, -1));
   else {
     const ValueState *ValS = State->get<GCValueMap>(Sym);
-    ValueState NewVState = ValueState::getAllocated();
-    if (ValS) {
-      // If the call was inlined, we may have accidentally killed the return
-      // value above. Revive it here.
-      const ValueState *PrevValState = C.getState()->get<GCValueMap>(Sym);
-      if (!ValS->isPotentiallyFreed() ||
-          (PrevValState && PrevValState->isPotentiallyFreed())) {
-        return false;
-      }
-      NewVState = *PrevValState;
-    }
+    ValueState NewVState = ValS ? *ValS : ValueState::getAllocated();
     auto *Decl = Call.getDecl();
     const FunctionDecl *FD = Decl ? Decl->getAsFunction() : nullptr;
     if (FD) {
@@ -1028,15 +1019,15 @@ SymbolRef GCChecker::getSymbolForResult(const Expr *Result,
                                         const ValueState *OldValS,
                                         ProgramStateRef &State,
                                         CheckerContext &C) const {
+  QualType QT = Result->getType();
+  if (!QT->isPointerType() || QT->getPointeeType()->isVoidType())
+    return nullptr;
   auto ValLoc = State->getSVal(Result, C.getLocationContext()).getAs<Loc>();
   if (!ValLoc) {
     return nullptr;
   }
   SVal Loaded = State->getSVal(*ValLoc);
   if (Loaded.isUnknown() || !Loaded.getAsSymbol()) {
-    QualType QT = Result->getType();
-    if (!QT->isPointerType())
-      return nullptr;
     if (OldValS || GCChecker::isGCTracked(Result)) {
       Loaded = C.getSValBuilder().conjureSymbolVal(
           nullptr, Result, C.getLocationContext(), Result->getType(),
@@ -1294,17 +1285,12 @@ void GCChecker::checkPreCall(const CallEvent &Call, CheckerContext &C) const {
   }
 }
 
-#if LLVM_VERSION_MAJOR >= 9
-bool GCChecker::evalCall(const CallEvent &Call,
-#else
-bool GCChecker::evalCall(const CallExpr *CE,
-#endif
-                         CheckerContext &C) const {
+bool GCChecker::evalCall(const CallEvent &Call, CheckerContext &C) const {
   // These checks should have no effect on the surrounding environment
   // (globals should not be invalidated, etc), hence the use of evalCall.
-#if LLVM_VERSION_MAJOR >= 9
   const CallExpr *CE = dyn_cast<CallExpr>(Call.getOriginExpr());
-#endif
+  if (!CE)
+    return false;
   unsigned CurrentDepth = C.getState()->get<GCDepth>();
   auto name = C.getCalleeName(CE);
   if (name == "JL_GC_POP") {

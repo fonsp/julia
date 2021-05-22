@@ -323,7 +323,8 @@ static void jl_encode_value_(jl_ircode_state *s, jl_value_t *v, int as_literal) 
     }
     else {
         if (!as_literal && !(jl_is_uniontype(v) || jl_is_newvarnode(v) || jl_is_tuple(v) ||
-                             jl_is_linenode(v) || jl_is_upsilonnode(v) || jl_is_pinode(v))) {
+                             jl_is_linenode(v) || jl_is_upsilonnode(v) || jl_is_pinode(v) ||
+                             jl_is_slot(v) || jl_is_ssavalue(v))) {
             int id = literal_val_id(s, v);
             assert(id >= 0);
             if (id < 256) {
@@ -417,7 +418,7 @@ static jl_value_t *jl_decode_value_array(jl_ircode_state *s, uint8_t tag) JL_GC_
         isptr = (elsize >> 15) & 1;
         hasptr = (elsize >> 14) & 1;
         isunion = (elsize >> 13) & 1;
-        elsize = elsize & 0x3fff;
+        elsize = elsize & 0x1fff;
     }
     size_t *dims = (size_t*)alloca(ndims * sizeof(size_t));
     for (i = 0; i < ndims; i++) {
@@ -701,7 +702,8 @@ JL_DLLEXPORT jl_array_t *jl_compress_ir(jl_method_t *m, jl_code_info_t *code)
         jl_get_ptls_states()
     };
 
-    uint8_t flags = (code->inferred << 3)
+    uint8_t flags = (code->aggressive_constprop << 4)
+                  | (code->inferred << 3)
                   | (code->inlineable << 2)
                   | (code->propagate_inbounds << 1)
                   | (code->pure << 0);
@@ -786,6 +788,7 @@ JL_DLLEXPORT jl_code_info_t *jl_uncompress_ir(jl_method_t *m, jl_code_instance_t
 
     jl_code_info_t *code = jl_new_code_info_uninit();
     uint8_t flags = read_uint8(s.s);
+    code->aggressive_constprop = !!(flags & (1 << 4));
     code->inferred = !!(flags & (1 << 3));
     code->inlineable = !!(flags & (1 << 2));
     code->propagate_inbounds = !!(flags & (1 << 1));

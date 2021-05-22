@@ -31,34 +31,36 @@ end
 
 ## expressions ##
 
-function copy(e::Expr)
-    n = Expr(e.head)
-    n.args = copy_exprargs(e.args)
-    return n
-end
+copy(e::Expr) = exprarray(e.head, copy_exprargs(e.args))
 
 # copy parts of an AST that the compiler mutates
-copy_exprs(@nospecialize(x)) = x
-copy_exprs(x::Expr) = copy(x)
-function copy_exprs(x::PhiNode)
-    new_values = Vector{Any}(undef, length(x.values))
-    for i = 1:length(x.values)
-        isassigned(x.values, i) || continue
-        new_values[i] = copy_exprs(x.values[i])
+function copy_exprs(@nospecialize(x))
+    if isa(x, Expr)
+        return copy(x)
+    elseif isa(x, PhiNode)
+        values = x.values
+        nvalues = length(values)
+        new_values = Vector{Any}(undef, nvalues)
+        @inbounds for i = 1:nvalues
+            isassigned(values, i) || continue
+            new_values[i] = copy_exprs(values[i])
+        end
+        return PhiNode(copy(x.edges), new_values)
+    elseif isa(x, PhiCNode)
+        values = x.values
+        nvalues = length(values)
+        new_values = Vector{Any}(undef, nvalues)
+        @inbounds for i = 1:nvalues
+            isassigned(values, i) || continue
+            new_values[i] = copy_exprs(values[i])
+        end
+        return PhiCNode(new_values)
     end
-    return PhiNode(copy(x.edges), new_values)
+    return x
 end
-function copy_exprs(x::PhiCNode)
-    new_values = Vector{Any}(undef, length(x.values))
-    for i = 1:length(x.values)
-        isassigned(x.values, i) || continue
-        new_values[i] = copy_exprs(x.values[i])
-    end
-    return PhiCNode(new_values)
-end
-copy_exprargs(x::Array{Any,1}) = Any[copy_exprs(x[i]) for i in 1:length(x)]
+copy_exprargs(x::Array{Any,1}) = Any[copy_exprs(@inbounds x[i]) for i in 1:length(x)]
 
-exprarray(head, args::Array{Any,1}) = (ex = Expr(head); ex.args = args; ex)
+@eval exprarray(head::Symbol, arg::Array{Any,1}) = $(Expr(:new, :Expr, :head, :arg))
 
 # create copies of the CodeInfo definition, and any mutable fields
 function copy(c::CodeInfo)
@@ -228,16 +230,23 @@ end
 `@pure` gives the compiler a hint for the definition of a pure function,
 helping for type inference.
 
-A pure function can only depend on immutable information.
-This also means a `@pure` function cannot use any global mutable state, including
-generic functions. Calls to generic functions depend on method tables which are
-mutable global state.
-Use with caution, incorrect `@pure` annotation of a function may introduce
-hard to identify bugs. Double check for calls to generic functions.
 This macro is intended for internal compiler use and may be subject to changes.
 """
 macro pure(ex)
     esc(isa(ex, Expr) ? pushmeta!(ex, :pure) : ex)
+end
+
+"""
+    @aggressive_constprop ex
+    @aggressive_constprop(ex)
+
+`@aggressive_constprop` requests more aggressive interprocedural constant
+propagation for the annotated function. For a method where the return type
+depends on the value of the arguments, this can yield improved inference results
+at the cost of additional compile time.
+"""
+macro aggressive_constprop(ex)
+    esc(isa(ex, Expr) ? pushmeta!(ex, :aggressive_constprop) : ex)
 end
 
 """

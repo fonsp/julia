@@ -60,9 +60,10 @@ while changing the settings of the optional keyword arguments:
   already open or on non-Windows systems.
 * `env`: Set environment variables to use when running the `Cmd`. `env` is either a
   dictionary mapping strings to strings, an array of strings of the form `"var=val"`, an
-  array or tuple of `"var"=>val` pairs, or `nothing`. In order to modify (rather than
-  replace) the existing environment, create `env` by `copy(ENV)` and then set
-  `env["var"]=val` as desired.
+  array or tuple of `"var"=>val` pairs. In order to modify (rather than replace) the
+  existing environment, initialize `env` with `copy(ENV)` and then set `env["var"]=val` as
+  desired.  To add to an environment block within a `Cmd` object without replacing all
+  elements, use [`addenv()`](@ref) which will return a `Cmd` object with the updated environment.
 * `dir::AbstractString`: Specify a working directory for the command (instead
   of the current directory).
 
@@ -102,8 +103,10 @@ shell_escape(cmd::Cmd; special::AbstractString="") =
     shell_escape(cmd.exec..., special=special)
 shell_escape_posixly(cmd::Cmd) =
     shell_escape_posixly(cmd.exec...)
-shell_escape_winsomely(cmd::Cmd) =
-    shell_escape_winsomely(cmd.exec...)
+escape_microsoft_c_args(cmd::Cmd) =
+    escape_microsoft_c_args(cmd.exec...)
+escape_microsoft_c_args(io::IO, cmd::Cmd) =
+    escape_microsoft_c_args(io::IO, cmd.exec...)
 
 function show(io::IO, cmd::Cmd)
     print_env = cmd.env !== nothing
@@ -162,6 +165,7 @@ rawhandle(x::OS_HANDLE) = x
 if OS_HANDLE !== RawFD
     rawhandle(x::RawFD) = Libc._get_osfhandle(x)
 end
+setup_stdio(stdio::Union{DevNull,OS_HANDLE,RawFD}, ::Bool) = (stdio, false)
 
 const Redirectable = Union{IO, FileRedirect, RawFD, OS_HANDLE}
 const StdIOSet = NTuple{3, Redirectable}
@@ -230,17 +234,56 @@ byteenv(env::Union{AbstractVector{Pair{T,V}}, Tuple{Vararg{Pair{T,V}}}}) where {
     setenv(command::Cmd, env; dir="")
 
 Set environment variables to use when running the given `command`. `env` is either a
-dictionary mapping strings to strings, an array of strings of the form `"var=val"`, or zero
-or more `"var"=>val` pair arguments. In order to modify (rather than replace) the existing
-environment, create `env` by `copy(ENV)` and then setting `env["var"]=val` as desired, or
-use `withenv`.
+dictionary mapping strings to strings, an array of strings of the form `"var=val"`, or
+zero or more `"var"=>val` pair arguments. In order to modify (rather than replace) the
+existing environment, create `env` through `copy(ENV)` and then setting `env["var"]=val`
+as desired, or use [`addenv`](@ref).
 
 The `dir` keyword argument can be used to specify a working directory for the command.
+
+See also [`Cmd`](@ref), [`addenv`](@ref), [`ENV`](@ref), [`pwd`](@ref).
 """
 setenv(cmd::Cmd, env; dir="") = Cmd(cmd; env=byteenv(env), dir=dir)
 setenv(cmd::Cmd, env::Pair{<:AbstractString}...; dir="") =
     setenv(cmd, env; dir=dir)
 setenv(cmd::Cmd; dir="") = Cmd(cmd; dir=dir)
+
+"""
+    addenv(command::Cmd, env...; inherit::Bool = true)
+
+Merge new environment mappings into the given [`Cmd`](@ref) object, returning a new `Cmd` object.
+Duplicate keys are replaced.  If `command` does not contain any environment values set already,
+it inherits the current environment at time of `addenv()` call if `inherit` is `true`.
+
+See also [`Cmd`](@ref), [`setenv`](@ref), [`ENV`](@ref).
+
+!!! compat "Julia 1.6"
+    This function requires Julia 1.6 or later.
+"""
+function addenv(cmd::Cmd, env::Dict; inherit::Bool = true)
+    new_env = Dict{String,String}()
+    if cmd.env === nothing
+        if inherit
+            merge!(new_env, ENV)
+        end
+    else
+        for (k, v) in split.(cmd.env, "=")
+            new_env[string(k)::String] = string(v)::String
+        end
+    end
+    for (k, v) in env
+        new_env[string(k)::String] = string(v)::String
+    end
+    return setenv(cmd, new_env)
+end
+
+function addenv(cmd::Cmd, pairs::Pair{<:AbstractString}...; inherit::Bool = true)
+    return addenv(cmd, Dict(k => v for (k, v) in pairs); inherit)
+end
+
+function addenv(cmd::Cmd, env::Vector{<:AbstractString}; inherit::Bool = true)
+    return addenv(cmd, Dict(k => v for (k, v) in split.(env, "=")); inherit)
+end
 
 (&)(left::AbstractCmd, right::AbstractCmd) = AndCmds(left, right)
 redir_out(src::AbstractCmd, dest::AbstractCmd) = OrCmds(src, dest)

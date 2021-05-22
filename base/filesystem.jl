@@ -42,7 +42,7 @@ import .Base:
     IOError, _UVError, _sizeof_uv_fs, check_open, close, eof, eventloop, fd, isopen,
     bytesavailable, position, read, read!, readavailable, seek, seekend, show,
     skip, stat, unsafe_read, unsafe_write, write, transcode, uv_error,
-    rawhandle, OS_HANDLE, INVALID_OS_HANDLE, windowserror, filesize
+    setup_stdio, rawhandle, OS_HANDLE, INVALID_OS_HANDLE, windowserror, filesize
 
 import .Base.RefValue
 
@@ -53,6 +53,9 @@ end
 # Average buffer size including null terminator for several filesystem operations.
 # On Windows we use the MAX_PATH = 260 value on Win32.
 const AVG_PATH = Sys.iswindows() ? 260 : 512
+
+# helper function to clean up libuv request
+uv_fs_req_cleanup(req) = ccall(:uv_fs_req_cleanup, Cvoid, (Ptr{Cvoid},), req)
 
 include("path.jl")
 include("stat.jl")
@@ -73,6 +76,7 @@ if OS_HANDLE !== RawFD
 end
 
 rawhandle(file::File) = file.handle
+setup_stdio(file::File, ::Bool) = (file, false)
 
 # Filesystem.open, not Base.open
 function open(path::AbstractString, flags::Integer, mode::Integer=0)
@@ -83,8 +87,8 @@ function open(path::AbstractString, flags::Integer, mode::Integer=0)
                     (Ptr{Cvoid}, Ptr{Cvoid}, Cstring, Int32, Int32, Ptr{Cvoid}),
                     C_NULL, req, path, flags, mode, C_NULL)
         handle = ccall(:uv_fs_get_result, Cssize_t, (Ptr{Cvoid},), req)
-        ccall(:uv_fs_req_cleanup, Cvoid, (Ptr{Cvoid},), req)
-        uv_error("open", ret)
+        uv_fs_req_cleanup(req)
+        ret < 0 && uv_error("open($(repr(path)), $flags, $mode)", ret)
     finally # conversion to Cstring could cause an exception
         Libc.free(req)
     end
