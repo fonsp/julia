@@ -27,7 +27,7 @@ result = mapfoldr(emoji_data, merge, [
     # overwrite the old with names that changed but still keep old ones that were removed
     "https://raw.githubusercontent.com/iamcal/emoji-data/0f0cf4ea8845eb52d26df2a48c3c31c3b8cad14e/emoji_pretty.json",
     "https://raw.githubusercontent.com/iamcal/emoji-data/e512953312c012f6bd00e3f2ef6bf152ca3710f8/emoji_pretty.json",
-    "https://raw.githubusercontent.com/iamcal/emoji-data/v15.1.2/emoji_pretty.json",
+    "https://raw.githubusercontent.com/iamcal/emoji-data/a8174c74675355c8c6a9564516b2e961fe7257ef/emoji_pretty.json",
     ];
     init=Dict()
 )
